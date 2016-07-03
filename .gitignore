@@ -1,0 +1,67 @@
+/target
+/lib
+/classes
+/checkouts
+pom.xml
+pom.xml.asc
+*.jar
+*.class
+/.lein-*
+/.nrepl-port
+.hgignore
+.hg/
+
+*.iml
+
+/dev/user
+/checkouts
+# Ignore hidden folders #
+# This takes care of .tmp, .sass-cache, and many others #
+.*/
+
+# Ignore OS generated files #
+.DS_Store*
+ehthumbs.db
+Thumbs.db
+
+# Always-ignore files and folders #
+*.diff
+*.err
+*.log
+*.orig
+*.rej
+*.swn
+*.swo
+*.swp
+*.swd
+*.swf
+*.swk
+*.swm
+*.sw*
+._*
+*~
+.ruby-version
+.ruby-gemset
+.lein-failures
+.lein-repl-history
+
+
+# Ignore packages #
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Ignore Directories
+target
+out
+
+Session.vim
+
+.lein-env
+node_modules
+
