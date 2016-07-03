@@ -9,17 +9,17 @@
             [goog.object :as obj])
   (:require-macros [microapps.macros :refer [kmap]]))
 
-;;; Initialization
+;;;; Initialization
 
 (declare producer-fn run)
 
-;;; NodeJS Inits
+;;;; NodeJS Inits
 
 (nodejs/enable-util-print!)
 (def -main (fn [] (println (str "development? " development?))))
 (set! *main-cli-fn* -main)
 
-;;; JS Interop
+;;;; JS Interop
 
 (defn js-print [s]
   (println s))
@@ -31,12 +31,12 @@
   (let [k (keyword s)]
     (s/def k pred)))
 
-;;; Spec Utils
+;;;; Spec Utils
 
 (defn register-spec [ns pred]
   (s/def ns pred))
 
-;;; Registration
+;;;; Registration
 
 (def producer-registry (atom []))
 (def consumer-registry (atom []))
@@ -64,7 +64,7 @@
 (defn add-constant-producer [spec handler type]
   (swap! producer-registry conj (with-meta [spec handler] {type true})))
 
-(defn get-spec [app]
+(defn validate-app [app]
   (let [{:keys [spec-in spec-out]} app]
     (cond
       (and spec-in spec-out) [spec-in spec-out]
@@ -73,6 +73,7 @@
       :else (throw (js/Error. "App must have either a spec-in or spec-out")))))
 
 (defn register-app [app]
+  (validate-app app)
   (let [{:keys [spec-in spec-out handler type]} app]
     (cond
       (and (= type :pure) spec-in spec-out) (add-transformer [spec-in spec-out] (memoize handler))
@@ -83,14 +84,14 @@
       spec-out (add-producer [nil spec-out])
       :else (throw (js/Error. "App must have either a spec-in or spec-out")))))
 
-;;; Start Initializations
+;;;; Start Initializations
 
 (defn stop []
   (reset! producer-registry [])
   (reset! consumer-registry [])
   (reset! transformer-registry []))
 
-;;; Run
+;;;; Run
 
 (defn producer-fn [[_ spec-out] msg]
   (run {spec-out msg}))
@@ -104,39 +105,29 @@
       (throw (ex-info "Output data is invalid."
                       (s/explain-data spec-out result))))))
 
+(defn spec-value-map [values specs]
+  (reduce (fn [acc spec] (assoc acc spec (get values spec)))
+          {}
+          specs))
+
+(defn invoke-app
+  [app values handler]
+  (let [[spec-in _] (first app)]
+    (cond
+      (vector? spec-in) (let [spec-in-vals (spec-value-map values spec-in)]
+                          (handler spec-in-vals))
+      :else (let [params (get values spec-in)]
+              (handler params)))))
+
 (defn invoke-transformers
   [all-values]
-  (let [invoke (partial call-handler all-values)]
-    (doseq [app @transformer-registry]
-      (let [[spec-in _] (first app)
-            values @all-values]
-        (cond
-          (vector? spec-in)
-          (let [spec-in-vals (reduce (fn [acc spec]
-                                       (assoc acc spec (get values spec)))
-                                     {}
-                                     spec-in)]
-            (invoke app spec-in-vals))
-          :else
-          (let [params (get values spec-in)]
-            (invoke app params)))))))
+  (doseq [app @transformer-registry]
+    (invoke-app app @all-values (partial call-handler all-values app))))
 
 (defn invoke-consumers
   [all-values]
   (doseq [app @consumer-registry]
-    (let [[spec-in _] (first app)
-          values @all-values
-          handler (last app)]
-      (cond
-        (vector? spec-in)
-        (let [spec-in-vals (reduce (fn [acc spec]
-                                     (assoc acc spec (get values spec)))
-                                   {}
-                                   spec-in)]
-          (handler spec-in-vals))
-        :else
-        (let [params (get values spec-in)]
-          (handler params))))))
+    (invoke-app app @all-values (last app))))
 
 (defn run [& [producer-message]]
   (let [all-values (atom {})
@@ -153,18 +144,27 @@
   (do
     (stop)
 
-    ;; Specs
+    ;;; Specs
 
-    (s/def ::user.id number?)
-    (s/def ::user.first-name string?)
-    (s/def ::user.last-name string?)
-    (s/def ::user.full-name string?)
-    (s/def ::user.salutation string?)
-    (s/def ::user.image string?)
-    (s/def ::user.object map?)
-    (s/def ::date.today string?)
+    (s/def ::number number?)
+    (s/def ::string string?)
+    (s/def ::map map?)
+    (s/def ::keyword keyword?)
 
-    ;; Constants
+    (s/def ::user.id ::number)
+    (s/def ::user.first-name ::string)
+    (s/def ::user.last-name ::string)
+    (s/def ::user.full-name ::string)
+    (s/def ::user.salutation ::string)
+    (s/def ::user.image ::string)
+    (s/def ::user.object ::map)
+    (s/def ::users (s/* ::user.object))
+    (s/def ::user.database ::users)
+    (s/def ::user.database.operation ::keyword)
+
+    (s/def ::date.today ::string)
+
+    ;;; Constants
 
     (register-app {:spec-out ::user.first-name
                    :type     :pure
@@ -179,13 +179,13 @@
                    :type     :pure
                    :handler  #(identity "Jul 3, 2016")})
 
-    ;; Repeaters
+    ;;; Repeaters
 
     (register-app {:spec-out ::user.id
                    :type     :repeat
                    :handler  #(rand-int 1000)})
 
-    ;; Pure Transformers
+    ;;; Pure Transformers
 
     (register-app {:spec-in  [::user.first-name ::user.last-name]
                    :spec-out ::user.full-name
@@ -201,7 +201,7 @@
                    :type     :pure
                    :handler  #(str "Mr. " %)})
 
-    ;; Transformers
+    ;;; Transformers
 
     (register-app {:spec-in  [::user.full-name ::user.id ::user.image ::user.salutation]
                    :spec-out ::user.object
@@ -212,18 +212,16 @@
                                :image (::user.image %)
                                :updated-at (.getTime (js/Date.)))})
 
-    ;; Stateful
+    ;;; Stateful
 
     (defonce users (atom []))
 
-    (s/def ::user.database (s/* ::user.object))
     (register-app {:spec-in  ::user.object
                    :spec-out ::user.database
                    :handler  (fn [user]
                                (swap! users conj user)
                                @users)})
 
-    (s/def ::user.database.operation keyword?)
     (register-app {:spec-in  ::user.database.operation
                    :spec-out ::user.database
                    :handler  (fn [operation]
@@ -232,7 +230,7 @@
                                  false)
                                @users)})
 
-    ;; Consumers
+    ;;; Consumers
 
     (register-app {:spec-in ::user.first-name
                    :handler #(println "Your first name:" %1 "\n")})
@@ -252,7 +250,7 @@
     (register-app {:spec-in ::user.database
                    :handler #(println "Users saved: " (count %))})
 
-    ;; Producers
+    ;;; Producers
 
     (def user-first-name (register-app {:spec-out ::user.first-name}))
     (def user-image (register-app {:spec-out ::user.image}))
@@ -267,7 +265,7 @@
   (print-registries)
   )
 
-;;; JS Exports
+;;;; JS Exports
 
 (obj/set js/module "exports" #js {:print       js-print
                                   :makeKeyword js-make-keyword
