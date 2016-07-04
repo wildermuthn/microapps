@@ -1,12 +1,14 @@
 (ns microapps.sample
-  (:require [microapps.apps :refer [run stop register-app]]
+  (:require [microapps.apps :refer [run reset-registries register-app
+                                    print-registries]]
             [microapps.utils :refer [timer]]
             [cljs.spec :as s]
             [cljs.pprint :refer [pprint]])
   (:require-macros [microapps.macros :refer [kmap]]))
 
 (defn sample []
-  (stop)
+
+  (reset-registries)
 
   ;;; Specs
 
@@ -110,8 +112,6 @@
                             (when image
                               (reset! last-image image)))})
 
-
-
   ;;; Consumers
 
   (register-app {:spec-in ::user.first-name
@@ -146,7 +146,7 @@
 
 (defn op [k & params]
   (let [f (get ops k)]
-    (timer f params)))
+    (apply timer f params)))
 
 (comment
 
