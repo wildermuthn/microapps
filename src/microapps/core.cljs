@@ -6,12 +6,13 @@
             [cljs.nodejs :as nodejs]
             [cljs.pprint :refer [pprint]]
             [cljs.reader]
+            [clojure.set :refer [difference]]
             [goog.object :as obj])
-  (:require-macros [microapps.macros :refer [kmap]]))
+  (:require-macros [microapps.macros :refer [kmap console-time]]))
 
 ;;;; Initialization
 
-(declare producer-fn run)
+(declare producer-fn run user-first-name user-info db-operation user-image ops)
 
 ;;;; NodeJS Inits
 
@@ -82,10 +83,10 @@
 
 ;;;; Run
 
-(defn producer-fn [[_ spec-out] & msg]
-  (let [value (if-not (vector? spec-out)
-                {spec-out (first msg)}
-                (zipmap spec-out msg))]
+(defn producer-fn [[_ spec-out] msg]
+  (let [value (if-not (map? msg)
+                {spec-out msg}
+                msg)]
     (run value)))
 
 (defn call-valid-handler [values app params]
@@ -111,8 +112,7 @@
         explain (if-not valid?
                   (merge {:spec-in  spec-in
                           :spec-out spec-out}
-                         (s/explain-data spec-in params)))
-        spec-form (s/form req-spec-in)]
+                         (s/explain-data spec-in params)))]
     (if valid?
       (call-valid-handler values app params)
       (pprint [:input-invalid explain]))))
@@ -125,8 +125,12 @@
 (defn invoke-app
   [app values handler]
   (let [[spec-in _] (first app)
-        spec-desc (s/form spec-in)]
+        spec-desc (s/form spec-in)
+        direct-value (get values spec-in)]
     (cond
+
+      ;; value from recursive loop
+      direct-value (handler direct-value)
 
       ;; keys spec
       (and (list? spec-desc)
@@ -135,19 +139,25 @@
                                    (apply hash-map)
                                    (map #(vector (first %) (set (last %))))
                                    (into {}))
-            value-map (spec-value-map values (concat req opt))
-            required-keys-map (s/conform (s/keys) (->> (filter #(req (first %)) value-map)
-                                                       (into {})))]
-        (handler required-keys-map))
+            values-map (->> (spec-value-map values (concat req opt))
+                            (filter (fn [[k v]]
+                                      (if v
+                                        true
+                                        (req k))))
+                            (into {}))]
+        (handler values-map))
+
       ;; producer with no spec-in
       (not spec-in) (handler true)
       :else (when-let [params (get values spec-in)]
               (handler params)))))
 
 (defn invoke-transformers
-  [all-values]
-  (doseq [app @transformer-registry]
-    (invoke-app app @all-values (partial call-handler all-values app))))
+  [all-values output-already]
+  (let [apps (filter (fn [[k v]]
+                       (not (output-already (last k)))) @transformer-registry)]
+    (doseq [app apps]
+      (invoke-app app @all-values (partial call-handler all-values app)))))
 
 (defn invoke-consumers
   [all-values]
@@ -167,162 +177,162 @@
 (defn run [& [producer]]
   (let [kill-n (atom 0)
         original-values (atom {})]
-    (loop [all-values (atom {})]
-      (invoke-producer all-values producer)
-      (invoke-repeating-producers all-values)
-      (invoke-transformers all-values)
-      (invoke-consumers all-values)
-      #_(when (and (not= @all-values @original-values)
-                   (< @kill-n 10))
-          (swap! kill-n inc)
-          (reset! original-values @all-values)
-          (println "RECURRING")
-          (recur all-values)))))
+    (invoke-repeating-producers original-values)
+    (invoke-producer original-values producer)
+    (loop [all-values (atom @original-values)]
+      (invoke-transformers all-values (-> @all-values keys set))
+      (let [diff (difference (-> @all-values keys set)
+                             (-> @original-values keys set))]
+        (if (and (not= 0 (count diff))
+                 (< @kill-n 10))
+          (do
+            (swap! kill-n inc)
+            (reset! original-values @all-values)
+            (recur all-values))
+          (invoke-consumers all-values))))))
 
-(comment
+(defn sample []
+  (stop)
+
+  ;;; Specs
+
+  (s/def ::number number?)
+  (s/def ::string string?)
+  (s/def ::map map?)
+  (s/def ::keyword keyword?)
+
+  (s/def ::user.id ::number)
+  (s/def ::user.first-name ::string)
+  (s/def ::user.last-name ::string)
+  (s/def ::user.full-name ::string)
+  (s/def ::user.salutation ::string)
+  (s/def ::user.image ::string)
+  (s/def ::user.updated-at ::number)
+  (s/def ::user.object (s/keys :req [::user.full-name ::user.id ::user.salutation ::user.updated-at]
+                               :opt [::user.image]))
+  (s/def ::user.database (s/coll-of ::user.object []))
+  (s/def ::user.database.operation ::keyword)
+
+  (s/def ::user.names (s/keys :req [::user.first-name ::user.last-name]))
+  (s/def ::user.all (s/keys :req [::user.full-name ::user.id ::user.salutation]
+                            :opt [::user.image]))
+
+  (s/def ::date.today ::string)
+
+  ;;; Constants
+
+  (register-app {:spec-out ::user.first-name
+                 :type     :pure
+                 :handler  #(identity "Nate")})
+
+  (register-app {:spec-out ::user.last-name
+                 :type     :pure
+                 :handler  #(identity "Wildermuth")})
+
+  (register-app {:spec-out ::date.today
+                 :type     :pure
+                 :handler  #(identity "Jul 3, 2016")})
+
+  ;;; Repeaters
+
+  (register-app {:spec-out ::user.id
+                 :type     :repeat
+                 :handler  #(rand-int 1000)})
+
+  ;;; Pure Transformers
+
+
+  (register-app {:spec-in  ::user.names
+                 :spec-out ::user.full-name
+                 :type     :pure
+                 :handler  #(do
+                             (println "Calculating ::user.full-name\n")
+                             (str (::user.first-name %)
+                                  " "
+                                  (::user.last-name %)))})
+
+  (register-app {:spec-in  ::user.full-name
+                 :spec-out ::user.salutation
+                 :type     :pure
+                 :handler  #(str "Mr. " %)})
+
+  ;;; Transformers
+
+  (register-app {:spec-in  ::user.all
+                 :spec-out ::user.object
+                 :handler  #(hash-map
+                             ::user.salutation (::user.salutation %)
+                             ::user.full-name (::user.full-name %)
+                             ::user.id (::user.id %)
+                             ::user.image (or (::user.image %) "")
+                             ::user.updated-at (.getTime (js/Date.))
+                             )})
+
+  ;;; Stateful
+
+  (def users (atom []))
+  (def last-image (atom ""))
+
+  (register-app {:spec-in  ::user.object
+                 :spec-out ::user.database
+                 :handler  (fn [user]
+                             (swap! users conj user)
+                             @users)})
+
+  (register-app {:spec-in  ::user.database.operation
+                 :spec-out ::user.database
+                 :handler  (fn [operation]
+                             (condp = operation
+                               :clear (reset! users [])
+                               false)
+                             @users)})
+
+  (register-app {:spec-out ::user.image
+                 :type     :repeat
+                 :handler  #(identity @last-image)})
+
+  (register-app {:spec-in ::user.image
+                 :handler (fn [image]
+                            (when image
+                              (reset! last-image image)))})
+
+
+
+  ;;; Consumers
+
+  (register-app {:spec-in ::user.first-name
+                 :handler #(println "Your first name:" %1 "\n")})
+
+  (register-app {:spec-in ::user.full-name :handler #(println "Your name:" %1 "\n")})
+
+  (register-app {:spec-in ::user.full-name
+                 :handler #(println "Seriously, Your name:" %1 "\n")})
+
+  (register-app {:spec-in (s/keys :req [::user.object ::date.today])
+                 :handler #(do
+                            (println (str "Today is " (::date.today %) "."))
+                            (println "Your user object:")
+                            (pprint (::user.object %)))})
+
+  (register-app {:spec-in ::user.database
+                 :handler #(println "Users saved: " (count %))})
+
+
+  ;;; Producers
+
+  (def user-first-name (register-app {:spec-out ::user.first-name}))
+  (def user-image (register-app {:spec-out ::user.image}))
+  (def user-info (register-app {:spec-out (s/keys :req [::user.first-name ::user.image])}))
+  (def db-operation (register-app {:spec-out ::user.database.operation}))
 
   (do
-    (stop)
+    (def start-time (.getTime (js/Date.)))
+    (pprint (run))
+    (def end-time (.getTime (js/Date.)))
+    (println (- end-time start-time)))
 
-    ;;; Specs
-
-    (s/def ::number number?)
-    (s/def ::string string?)
-    (s/def ::map map?)
-    (s/def ::keyword keyword?)
-
-    (s/def ::user.id ::number)
-    (s/def ::user.first-name ::string)
-    (s/def ::user.last-name ::string)
-    (s/def ::user.full-name ::string)
-    (s/def ::user.salutation ::string)
-    (s/def ::user.image ::string)
-    (s/def ::user.updated-at ::number)
-    (s/def ::user.object (s/keys :req [::user.full-name ::user.id ::user.salutation ::user.updated-at]
-                                 :opt [::user.image]))
-    (s/def ::user.database (s/coll-of ::user.object []))
-    (s/def ::user.database.operation ::keyword)
-
-    (s/def ::user.names (s/keys :req [::user.first-name ::user.last-name]))
-    (s/def ::user.all (s/keys :req [::user.full-name ::user.id ::user.salutation]
-                              :opt [::user.image]))
-
-    (s/def ::date.today ::string)
-
-    ;;; Constants
-
-    (register-app {:spec-out ::user.first-name
-                   :type     :pure
-                   :handler  #(identity "Nate")})
-
-    (register-app {:spec-out ::user.last-name
-                   :type     :pure
-                   :handler  #(identity "Wildermuth")})
-
-    (register-app {:spec-out ::date.today
-                   :type     :pure
-                   :handler  #(identity "Jul 3, 2016")})
-
-    ;;; Repeaters
-
-    (register-app {:spec-out ::user.id
-                   :type     :repeat
-                   :handler  #(rand-int 1000)})
-
-    ;;; Pure Transformers
-
-
-    (register-app {:spec-in  ::user.names
-                   :spec-out ::user.full-name
-                   ;;:type     :pure
-                   :handler  #(do
-                               (println "Calculating ::user.full-name\n")
-                               (str (::user.first-name %)
-                                    " "
-                                    (::user.last-name %)))})
-
-    (register-app {:spec-in  ::user.full-name
-                   :spec-out ::user.salutation
-                   :type     :pure
-                   :handler  #(str "Mr. " %)})
-
-    ;;; Transformers
-
-
-    (register-app {:spec-in  ::user.all
-                   :spec-out ::user.object
-                   :handler  #(hash-map
-                               ::user.salutation (::user.salutation %)
-                               ::user.full-name (::user.full-name %)
-                               ::user.id (::user.id %)
-                               ::user.image (or (::user.image %) "")
-                               ::user.updated-at (.getTime (js/Date.))
-                               )})
-
-    ;;; Stateful
-
-    (defonce users (atom []))
-    (def last-image (atom ""))
-
-    (register-app {:spec-in  ::user.object
-                   :spec-out ::user.database
-                   :handler  (fn [user]
-                               (swap! users conj user)
-                               @users)})
-
-    (register-app {:spec-in  ::user.database.operation
-                   :spec-out ::user.database
-                   :handler  (fn [operation]
-                               (condp = operation
-                                 :clear (reset! users [])
-                                 false)
-                               @users)})
-
-    (register-app {:spec-in  (s/nilable ::user.image)
-                   :spec-out ::user.image
-                   :type     :repeat
-                   :handler  (fn [image]
-                               (when image
-                                 (reset! last-image image))
-                               @last-image)})
-
-    ;;; Consumers
-
-    (register-app {:spec-in ::user.first-name
-                   :handler #(println "Your first name:" %1 "\n")})
-
-    (register-app {:spec-in ::user.full-name :handler #(println "Your name:" %1 "\n")})
-
-    (register-app {:spec-in ::user.full-name
-                   :handler #(println "Seriously, Your name:" %1 "\n")})
-
-    (register-app {:spec-in (s/keys :req [::user.object ::date.today])
-                   :handler #(do
-                              (println (str "Today is " (::date.today %) "."))
-                              (println "Your user object:")
-                              (pprint (::user.object %)))})
-
-    (register-app {:spec-in ::user.database
-                   :handler #(println "Users saved: " (count %))})
-
-    ;;; Producers
-
-    (def user-first-name (register-app {:spec-out ::user.first-name}))
-    (def user-image (register-app {:spec-out ::user.image}))
-    (def user-info (register-app {:spec-out (s/keys :req [::user.first-name ::user.image])}))
-    (def db-operation (register-app {:spec-out ::user.database.operation}))
-
-    (run)
-    true
-    )
-
-  (user-image "my-image")
-  (user-info "Nathaniel" "another-image")
-
-  (pprint @users)
-
-  (print-registries)
-  )
+  (def ops (kmap user-first-name user-image user-info db-operation))
+  true)
 
 ;;;; JS Interop
 
