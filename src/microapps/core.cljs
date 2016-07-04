@@ -19,20 +19,9 @@
 (def -main (fn [] (println (str "development? " development?))))
 (set! *main-cli-fn* -main)
 
-;;;; JS Interop
-
-(defn js-print [s]
-  (println s))
-
-(defn js-make-keyword [s-ns s-key]
-  (keyword s-ns s-key))
-
-(defn js-make-spec [s pred]
-  (let [k (keyword s)]
-    (s/def k pred)))
-
 ;;;; Spec Utils
 
+(s/def ::on-start ::s/any)
 (defn register-spec [ns pred]
   (s/def ns pred))
 
@@ -77,8 +66,8 @@
   (let [{:keys [spec-in spec-out handler type]} app]
     (cond
       (and (= type :pure) spec-in spec-out) (add-transformer [spec-in spec-out] (memoize handler))
-      (and (= type :pure) spec-out) (add-constant-producer [nil spec-out] (memoize handler) :pure)
-      (and (= type :repeat) spec-out) (add-constant-producer [nil spec-out] handler :repeat)
+      (= type :pure) (add-constant-producer [spec-in spec-out] (memoize handler) :pure)
+      (= type :repeat) (add-constant-producer [spec-in spec-out] handler :repeat)
       (and spec-in spec-out) (add-transformer [spec-in spec-out] handler)
       spec-in (add-consumer [spec-in nil] handler)
       spec-out (add-producer [nil spec-out])
@@ -93,17 +82,40 @@
 
 ;;;; Run
 
-(defn producer-fn [[_ spec-out] msg]
-  (run {spec-out msg}))
+(defn producer-fn [[_ spec-out] & msg]
+  (let [value (if-not (vector? spec-out)
+                {spec-out (first msg)}
+                (zipmap spec-out msg))]
+    (run value)))
 
-(defn call-handler [values app params]
-  (let [[[_ spec-out] handler] app
+(defn call-valid-handler [values app params]
+  (let [[[spec-in spec-out] handler] app
         result (handler params)
-        valid? (s/valid? spec-out result)]
+        valid? (s/valid? spec-out result)
+        explain (if-not valid?
+                  (merge {:spec-in  spec-in
+                          :spec-out spec-out}
+                         (s/explain-data spec-out result)))]
     (if valid?
       (swap! values assoc spec-out result)
-      (throw (ex-info "Output data is invalid."
-                      (s/explain-data spec-out result))))))
+      (pprint [:output-invalid explain]))))
+
+(defn call-handler [values app params]
+  (let [[spec-in spec-out] (first app)
+        spec-desc (s/describe spec-in)
+        req-spec-in (if (and (list? spec-desc)
+                             (= 'keys (first spec-desc)))
+                      (s/keys)
+                      spec-in)
+        valid? (s/valid? req-spec-in params)
+        explain (if-not valid?
+                  (merge {:spec-in  spec-in
+                          :spec-out spec-out}
+                         (s/explain-data spec-in params)))
+        spec-form (s/form req-spec-in)]
+    (if valid?
+      (call-valid-handler values app params)
+      (pprint [:input-invalid explain]))))
 
 (defn spec-value-map [values specs]
   (reduce (fn [acc spec] (assoc acc spec (get values spec)))
@@ -112,11 +124,24 @@
 
 (defn invoke-app
   [app values handler]
-  (let [[spec-in _] (first app)]
+  (let [[spec-in _] (first app)
+        spec-desc (s/form spec-in)]
     (cond
-      (vector? spec-in) (let [spec-in-vals (spec-value-map values spec-in)]
-                          (handler spec-in-vals))
-      :else (let [params (get values spec-in)]
+
+      ;; keys spec
+      (and (list? spec-desc)
+           (= 'cljs.spec/keys (first spec-desc)))
+      (let [{:keys [req opt]} (->> (rest spec-desc)
+                                   (apply hash-map)
+                                   (map #(vector (first %) (set (last %))))
+                                   (into {}))
+            value-map (spec-value-map values (concat req opt))
+            required-keys-map (s/conform (s/keys) (->> (filter #(req (first %)) value-map)
+                                                       (into {})))]
+        (handler required-keys-map))
+      ;; producer with no spec-in
+      (not spec-in) (handler true)
+      :else (when-let [params (get values spec-in)]
               (handler params)))))
 
 (defn invoke-transformers
@@ -129,15 +154,30 @@
   (doseq [app @consumer-registry]
     (invoke-app app @all-values (last app))))
 
-(defn run [& [producer-message]]
-  (let [all-values (atom {})
-        invoke (partial call-handler all-values)]
-    (doseq [app (filter #(or (:pure (meta %))
-                             (:repeat (meta %))) @producer-registry)]
-      (invoke app true))
-    (swap! all-values merge producer-message)
-    (invoke-transformers all-values)
-    (invoke-consumers all-values)))
+(defn invoke-repeating-producers
+  [all-values]
+  (doseq [app (filter #(or (:pure (meta %))
+                           (:repeat (meta %))) @producer-registry)]
+    (invoke-app app @all-values (partial call-handler all-values app))))
+
+(defn invoke-producer
+  [all-values value]
+  (swap! all-values merge value))
+
+(defn run [& [producer]]
+  (let [kill-n (atom 0)
+        original-values (atom {})]
+    (loop [all-values (atom {})]
+      (invoke-producer all-values producer)
+      (invoke-repeating-producers all-values)
+      (invoke-transformers all-values)
+      (invoke-consumers all-values)
+      #_(when (and (not= @all-values @original-values)
+                   (< @kill-n 10))
+          (swap! kill-n inc)
+          (reset! original-values @all-values)
+          (println "RECURRING")
+          (recur all-values)))))
 
 (comment
 
@@ -157,10 +197,15 @@
     (s/def ::user.full-name ::string)
     (s/def ::user.salutation ::string)
     (s/def ::user.image ::string)
-    (s/def ::user.object ::map)
-    (s/def ::users (s/* ::user.object))
-    (s/def ::user.database ::users)
+    (s/def ::user.updated-at ::number)
+    (s/def ::user.object (s/keys :req [::user.full-name ::user.id ::user.salutation ::user.updated-at]
+                                 :opt [::user.image]))
+    (s/def ::user.database (s/coll-of ::user.object []))
     (s/def ::user.database.operation ::keyword)
+
+    (s/def ::user.names (s/keys :req [::user.first-name ::user.last-name]))
+    (s/def ::user.all (s/keys :req [::user.full-name ::user.id ::user.salutation]
+                              :opt [::user.image]))
 
     (s/def ::date.today ::string)
 
@@ -174,8 +219,7 @@
                    :type     :pure
                    :handler  #(identity "Wildermuth")})
 
-    (register-app {:spec-in  ::on-start
-                   :spec-out ::date.today
+    (register-app {:spec-out ::date.today
                    :type     :pure
                    :handler  #(identity "Jul 3, 2016")})
 
@@ -187,9 +231,10 @@
 
     ;;; Pure Transformers
 
-    (register-app {:spec-in  [::user.first-name ::user.last-name]
+
+    (register-app {:spec-in  ::user.names
                    :spec-out ::user.full-name
-                   :type     :pure
+                   ;;:type     :pure
                    :handler  #(do
                                (println "Calculating ::user.full-name\n")
                                (str (::user.first-name %)
@@ -203,18 +248,21 @@
 
     ;;; Transformers
 
-    (register-app {:spec-in  [::user.full-name ::user.id ::user.image ::user.salutation]
+
+    (register-app {:spec-in  ::user.all
                    :spec-out ::user.object
                    :handler  #(hash-map
-                               :salutation (::user.salutation %)
-                               :full-name (::user.full-name %)
-                               :id (::user.id %)
-                               :image (::user.image %)
-                               :updated-at (.getTime (js/Date.)))})
+                               ::user.salutation (::user.salutation %)
+                               ::user.full-name (::user.full-name %)
+                               ::user.id (::user.id %)
+                               ::user.image (or (::user.image %) "")
+                               ::user.updated-at (.getTime (js/Date.))
+                               )})
 
     ;;; Stateful
 
     (defonce users (atom []))
+    (def last-image (atom ""))
 
     (register-app {:spec-in  ::user.object
                    :spec-out ::user.database
@@ -230,18 +278,25 @@
                                  false)
                                @users)})
 
+    (register-app {:spec-in  (s/nilable ::user.image)
+                   :spec-out ::user.image
+                   :type     :repeat
+                   :handler  (fn [image]
+                               (when image
+                                 (reset! last-image image))
+                               @last-image)})
+
     ;;; Consumers
 
     (register-app {:spec-in ::user.first-name
                    :handler #(println "Your first name:" %1 "\n")})
 
-    (register-app {:spec-in ::user.full-name
-                   :handler #(println "Your name:" %1 "\n")})
+    (register-app {:spec-in ::user.full-name :handler #(println "Your name:" %1 "\n")})
 
     (register-app {:spec-in ::user.full-name
                    :handler #(println "Seriously, Your name:" %1 "\n")})
 
-    (register-app {:spec-in [::user.object ::date.today]
+    (register-app {:spec-in (s/keys :req [::user.object ::date.today])
                    :handler #(do
                               (println (str "Today is " (::date.today %) "."))
                               (println "Your user object:")
@@ -254,22 +309,37 @@
 
     (def user-first-name (register-app {:spec-out ::user.first-name}))
     (def user-image (register-app {:spec-out ::user.image}))
-    (def user-info (register-app {:spec-out [::user.first-name ::user.image]}))
+    (def user-info (register-app {:spec-out (s/keys :req [::user.first-name ::user.image])}))
     (def db-operation (register-app {:spec-out ::user.database.operation}))
 
     (run)
     true
     )
 
+  (user-image "my-image")
+  (user-info "Nathaniel" "another-image")
+
+  (pprint @users)
 
   (print-registries)
   )
 
-;;;; JS Exports
+;;;; JS Interop
+
+(defn js-print [s]
+  (println s))
+
+(defn js-make-keyword [s-ns s-key]
+  (keyword s-ns s-key))
+
+(defn js-make-spec [s pred]
+  (let [k (keyword s)]
+    (s/def k pred)))
 
 (obj/set js/module "exports" #js {:print       js-print
                                   :makeKeyword js-make-keyword
                                   :makeSpec    js-make-spec
                                   :isValid     s/valid?
                                   :explain     s/explain-data})
+
 

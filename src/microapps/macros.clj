@@ -8,3 +8,4 @@
 
 (defmacro register-spec [ns pred]
   `(s/def ~ns ~pred))
+
