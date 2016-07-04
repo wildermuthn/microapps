@@ -12,3 +12,9 @@
 
 (defn fn-name [f]
   (keyword (remove-fns (str f))))
+
+(defn timer [f & params]
+  (do
+    (.time js/console "timer")
+    (apply f params)
+    (.timeEnd js/console "timer")))
