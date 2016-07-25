@@ -1,7 +1,8 @@
 (ns microapps.apps
   (:refer-clojure :exclude [print])
   (:require [microapps.config :refer [development?]]
-            [microapps.utils :refer [fn-name]]
+            [microapps.utils :refer [fn-name spec-value-map]]
+            [microapps.registries :as registry]
             [cljs.spec :as s]
             [cljs.nodejs :as nodejs]
             [cljs.pprint :refer [pprint]]
@@ -12,8 +13,7 @@
 
 ;;; Declarations
 
-(declare run producer-fn reset-registries print-registries
-         consumer-registry producer-registry transformer-registry)
+(declare run)
 
 ;;; NodeJS Inits
 
@@ -21,70 +21,28 @@
 (def -main (fn [] (println (str "development? " development?))))
 (set! *main-cli-fn* -main)
 
-;;; Spec Utils
+;;; Specs
 
 (s/def ::on-start ::s/any)
 
-;;; Registration Atoms
+(s/def ::key-or-spec (s/or :k keyword?
+                           :spec #(s/spec? %)))
 
-(def producer-registry (atom []))
-(def consumer-registry (atom []))
-(def transformer-registry (atom []))
+(s/def ::spec-in ::key-or-spec)
+(s/def ::spec-out ::key-or-spec)
+(s/def ::handler fn?)
+(s/def ::type #{:pure :repeat})
+(s/def ::app (s/and (s/keys :opt-un [::type])
+                    (s/or
+                      ::a-transformer (s/keys :req-un [::spec-in ::spec-out
+                                                       ::handler])
+                      ::a-consumer (s/keys :req-un [::spec-in ::handler])
+                      ::a-producer (s/keys :req-un [::spec-out]))))
 
-;;; Registration Utils
 
-(defn reset-registries []
-  (reset! producer-registry [])
-  (reset! consumer-registry [])
-  (reset! transformer-registry []))
+;;;; App Invocation
 
-(defn print-registries []
-  (let [reducer #(reduce-kv (fn [acc k v]
-                              (assoc acc k (fn-name v)))
-                            {}
-                            (deref %1))
-        [consumer transformers] (map reducer [consumer-registry transformer-registry])
-        producers @producer-registry]
-    (pprint (kmap consumer transformers producers))))
-
-;;; Registration Adders
-
-(defn add-consumer [spec handler]
-  (swap! consumer-registry conj [spec handler]))
-
-(defn add-producer [spec]
-  (swap! producer-registry conj [spec identity])
-  (partial producer-fn spec))
-
-(defn add-transformer [spec handler]
-  (swap! transformer-registry conj [spec handler]))
-
-(defn add-constant-producer [spec handler type]
-  (swap! producer-registry conj (with-meta [spec handler] {type true})))
-
-(defn validate-app [app]
-  (let [{:keys [spec-in spec-out]} app]
-    (cond
-      (and spec-in spec-out) [spec-in spec-out]
-      spec-in spec-in
-      spec-out spec-out
-      :else (throw (js/Error. "App must have either a spec-in or spec-out")))))
-
-(defn register-app [app]
-  (validate-app app)
-  (let [{:keys [spec-in spec-out handler type]} app]
-    (cond
-      (and (= type :pure) spec-in spec-out) (add-transformer [spec-in spec-out] (memoize handler))
-      (= type :pure) (add-constant-producer [spec-in spec-out] (memoize handler) :pure)
-      (= type :repeat) (add-constant-producer [spec-in spec-out] handler :repeat)
-      (and spec-in spec-out) (add-transformer [spec-in spec-out] handler)
-      spec-in (add-consumer [spec-in nil] handler)
-      spec-out (add-producer [nil spec-out])
-      :else (throw (js/Error. "App must have either a spec-in or spec-out")))))
-
-;;;; App Handlers
-
-(defn producer-fn [[_ spec-out] msg]
+(defn call-producer [[_ spec-out] msg]
   (let [value (if-not (map? msg)
                 {spec-out msg}
                 msg)]
@@ -117,11 +75,6 @@
     (if valid?
       (call-valid-handler values app params)
       (pprint [:input-invalid explain]))))
-
-(defn spec-value-map [values specs]
-  (reduce (fn [acc spec] (assoc acc spec (get values spec)))
-          {}
-          specs))
 
 ;;; Handler Invocations
 
@@ -156,42 +109,59 @@
               (handler params)))))
 
 (defn invoke-transformers
-  [all-values output-already]
-  (let [apps (filter (fn [[k v]]
-                       (not (output-already (last k)))) @transformer-registry)]
+  [app-results]
+  (let [apps (registry/get-transformers)]
     (doseq [app apps]
-      (invoke-app app @all-values (partial call-handler all-values app)))))
+      (invoke-app app @app-results (partial call-handler app-results app)))))
 
 (defn invoke-consumers
-  [all-values]
-  (doseq [app @consumer-registry]
-    (invoke-app app @all-values (last app))))
+  [app-results]
+  (let [consumers (registry/get-consumers)]
+    (doseq [app consumers]
+      (invoke-app app @app-results (last app)))))
 
-(defn invoke-repeating-producers
-  [all-values]
-  (doseq [app (filter #(or (:pure (meta %))
-                           (:repeat (meta %))) @producer-registry)]
-    (invoke-app app @all-values (partial call-handler all-values app))))
+(defn invoke-constant-producers
+  [app-results]
+  (let [producers (registry/get-producers)]
+    (doseq [app (filter #(or (:pure (meta %))
+                             (:repeat (meta %))) producers)]
+      (invoke-app app @app-results (partial call-handler app-results app)))))
 
-(defn invoke-producer
-  [all-values value]
-  (swap! all-values merge value))
+(defn merge-invoked-value
+  [app-results value]
+  (swap! app-results merge value))
 
 ;;; Main loop
 
-(defn run [& [producer]]
-  (let [kill-n (atom 0)
-        original-values (atom {})]
-    (invoke-repeating-producers original-values)
-    (invoke-producer original-values producer)
-    (loop [all-values (atom @original-values)]
-      (invoke-transformers all-values (-> @all-values keys set))
-      (let [diff (difference (-> @all-values keys set)
-                             (-> @original-values keys set))]
-        (if (and (not= 0 (count diff))
-                 (< @kill-n 10))
-          (do
-            (swap! kill-n inc)
-            (reset! original-values @all-values)
-            (recur all-values))
-          (invoke-consumers all-values))))))
+(defn run [& [invoked-producer-value]]
+  (let [app-results (atom {})]
+    (invoke-constant-producers app-results)
+    (merge-invoked-value app-results invoked-producer-value)
+    (invoke-transformers app-results)
+    (invoke-consumers app-results)))
+
+;;; Validation and Registration
+
+(defn register-app [app]
+  (let [{:keys [spec-in spec-out handler type]} app]
+    (cond
+      (and (= type :pure) spec-in spec-out) (registry/add-transformer [spec-in spec-out] (memoize handler))
+      (= type :pure) (registry/add-constant-producer [spec-in spec-out] (memoize handler) :pure)
+      (= type :repeat) (registry/add-constant-producer [spec-in spec-out] handler :repeat)
+      (and spec-in spec-out) (registry/add-transformer [spec-in spec-out] handler)
+      spec-in (registry/add-consumer [spec-in nil] handler)
+      spec-out (registry/add-producer call-producer [nil spec-out])
+      :else nil)))
+
+(defn enable-apps [apps]
+  (reset! registry/enabled apps))
+
+(defn order-apps [apps]
+  (reset! registry/ordered
+          (into {} (map-indexed (fn [i e]
+                                  [e i]) apps))))
+
+(s/fdef register-app
+  :args (s/cat :app ::app))
+
+(s/instrument #'register-app)

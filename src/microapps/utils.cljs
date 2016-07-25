@@ -1,5 +1,6 @@
 (ns microapps.utils
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [cljs.pprint :refer [pprint]]))
 
 (defn remove-fns [s]
   (str/replace
@@ -18,3 +19,8 @@
     (.time js/console "timer")
     (apply f params)
     (.timeEnd js/console "timer")))
+
+(defn spec-value-map [values specs]
+  (reduce (fn [acc spec] (assoc acc spec (get values spec)))
+          {}
+          specs))

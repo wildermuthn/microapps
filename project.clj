@@ -12,7 +12,6 @@
                                    :optimizations :none
                                    :output-to "target/index.js"
                                    :output-dir "target"
-                                   :source-map true
                                    :parallel-build true
                                    :cache-analysis true
                                    :closure-defines {"microapps.config.DEVELOPMENT" true}}}
